@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit
 class MainActivity : Activity() {
 
     // >>> PUT YOUR RENDER URL HERE (use wss:// not https://) <<<
-    private val SERVER_URL = "wss://YOUR-SERVER.onrender.com"
+    private val SERVER_URL = "wss://mobileremote.onrender.com/"
 
     private val BG = Color.parseColor("#06112B")
     private val CARD = Color.parseColor("#0D1F4A")
