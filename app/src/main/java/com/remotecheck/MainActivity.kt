@@ -1,29 +1,29 @@
 package com.remotecheck
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.content.SharedPreferences
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.widget.*
-import okhttp3.*
-import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 class MainActivity : Activity() {
 
-    // >>> PUT YOUR RENDER URL HERE (use wss:// not https://) <<<
-    private val SERVER_URL = "wss://mobileremote.onrender.com/"
+    private val REQ_CAPTURE = 1001
+    private val REQ_NOTIF = 1002
 
     private val BG = Color.parseColor("#06112B")
     private val CARD = Color.parseColor("#0D1F4A")
@@ -32,30 +32,42 @@ class MainActivity : Activity() {
     private val LIGHT = Color.parseColor("#5C8DFF")
     private val SUB = Color.parseColor("#8FA8E0")
     private val DIM = Color.parseColor("#3A4A75")
-
-    private val client = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
-    private val handler = Handler(Looper.getMainLooper())
-    private var ws: WebSocket? = null
-    private lateinit var prefs: SharedPreferences
+    private val GOOD = Color.parseColor("#3DDC97")
+    private val WARN = Color.parseColor("#FFB020")
 
     private lateinit var idText: TextView
     private lateinit var statusText: TextView
     private lateinit var statusDot: View
+    private lateinit var accessText: TextView
     private lateinit var targetInput: EditText
     private lateinit var connectBtn: Button
     private lateinit var endBtn: Button
 
-    private var myId = ""
-    private var peerId: String? = null
-    private var closing = false
+    private var dialog: AlertDialog? = null
+    private var handledFor: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        prefs = getSharedPreferences("rc", MODE_PRIVATE)
         window.statusBarColor = BG
         window.navigationBarColor = BG
         buildUi()
-        connectServer()
+        Hub.start(this)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        Hub.onChange = { render() }
+        render()
+    }
+
+    override fun onPause() {
+        Hub.onChange = null
+        super.onPause()
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -119,6 +131,7 @@ class MainActivity : Activity() {
         pill.addView(statusDot); pill.addView(statusText)
         root.addView(pill)
 
+        // --- Your ID ---
         val idCard = card()
         idCard.addView(label("YOUR ID"))
         idText = TextView(this).apply {
@@ -130,6 +143,24 @@ class MainActivity : Activity() {
         idCard.addView(button("Copy ID", false) { copyId() })
         root.addView(idCard)
 
+        // --- Allow control (this phone) ---
+        val accCard = card()
+        accCard.addView(label("ALLOW CONTROL OF THIS PHONE"))
+        accessText = TextView(this).apply {
+            text = "Remote control: OFF"; textSize = 16f; setTextColor(WARN)
+            typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(8), 0, 0)
+        }
+        accCard.addView(accessText)
+        accCard.addView(TextView(this).apply {
+            text = "Turn this on if someone will control THIS phone. Open Accessibility settings, choose RemoteCheck, then switch it on."
+            textSize = 12f; setTextColor(SUB); setPadding(0, dp(6), 0, 0)
+        })
+        accCard.addView(button("Open Accessibility settings", false) {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        })
+        root.addView(accCard)
+
+        // --- Connect ---
         val connectCard = card()
         connectCard.addView(label("CONNECT TO A DEVICE"))
         targetInput = EditText(this).apply {
@@ -144,7 +175,7 @@ class MainActivity : Activity() {
         connectCard.addView(targetInput)
         connectBtn = button("Connect", true) { sendRequest() }
         connectCard.addView(connectBtn)
-        endBtn = button("End session", false) { endSession() }
+        endBtn = button("End session", false) { Hub.endSession() }
         endBtn.visibility = View.GONE
         connectCard.addView(endBtn)
         root.addView(connectCard)
@@ -157,123 +188,88 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { setBackgroundColor(BG); addView(root) })
     }
 
-    private fun setStatus(text: String, online: Boolean) {
-        statusText.text = text
-        (statusDot.background as GradientDrawable).setColor(if (online) LIGHT else DIM)
+    private fun fmt(id: String) = id.chunked(3).joinToString(" ")
+
+    private fun render() {
+        idText.text = if (Hub.myId.isEmpty()) "--- --- ---" else fmt(Hub.myId)
+        statusText.text = Hub.statusText
+        (statusDot.background as GradientDrawable).setColor(if (Hub.online) LIGHT else DIM)
+
+        val busy = Hub.role != Hub.Role.NONE
+        connectBtn.isEnabled = !busy
+        connectBtn.alpha = if (busy) 0.4f else 1f
+        endBtn.visibility = if (busy) View.VISIBLE else View.GONE
+
+        val on = RemoteControlService.instance != null
+        accessText.text = if (on) "Remote control: ON" else "Remote control: OFF"
+        accessText.setTextColor(if (on) GOOD else WARN)
+
+        // incoming request dialog
+        val p = Hub.pendingFrom
+        if (p == null) {
+            handledFor = null
+            if (dialog?.isShowing == true) dialog?.dismiss()
+        } else if (handledFor != p && dialog?.isShowing != true) {
+            askPermission(p)
+        }
+
+        // open the viewer screen once the other phone accepted
+        if (Hub.role == Hub.Role.VIEWER && Hub.active && !Hub.viewerOpened) {
+            Hub.viewerOpened = true
+            startActivity(Intent(this, ViewerActivity::class.java))
+        }
     }
 
     private fun copyId() {
-        if (myId.isEmpty()) return
+        if (Hub.myId.isEmpty()) return
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("id", myId))
+        cm.setPrimaryClip(ClipData.newPlainText("id", Hub.myId))
         toast("ID copied")
     }
-
-    private fun connectServer() {
-        if (SERVER_URL.contains("YOUR-SERVER")) {
-            setStatus("Server URL not set in code", false); return
-        }
-        closing = true
-        ws?.close(1000, null)
-        closing = false
-        setStatus("Connecting to server...", false)
-        try {
-            ws = client.newWebSocket(Request.Builder().url(SERVER_URL).build(), listener)
-        } catch (e: Exception) {
-            setStatus("Invalid server URL", false)
-        }
-    }
-
-    private fun send(obj: JSONObject) { ws?.send(obj.toString()) }
 
     private fun sendRequest() {
         val target = targetInput.text.toString().trim()
         if (target.length != 9) { toast("Enter a 9-digit ID"); return }
-        peerId = target
-        setStatus("Waiting for $target to accept...", true)
-        send(JSONObject().put("type", "request").put("to", target))
-    }
-
-    private fun endSession() {
-        peerId?.let { send(JSONObject().put("type", "end").put("to", it)) }
-        sessionEnded("Session ended")
-    }
-
-    private fun sessionEnded(msg: String) {
-        peerId = null
-        setStatus(msg, true)
-        endBtn.visibility = View.GONE
-        connectBtn.isEnabled = true
-        connectBtn.alpha = 1f
+        if (!Hub.online) { toast("Not connected to the server yet"); return }
+        Hub.sendRequest(target)
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
-    private val listener = object : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            val saved = prefs.getString("id", "") ?: ""
-            webSocket.send(JSONObject().put("type", "register").put("id", saved).toString())
-        }
-
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            val m = JSONObject(text)
-            runOnUiThread { handle(m) }
-        }
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            if (webSocket != ws) return
-            runOnUiThread { setStatus("Offline. Retrying...", false) }
-            handler.postDelayed({ if (!closing && webSocket == ws) connectServer() }, 3000)
-        }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (webSocket != ws || closing) return
-            runOnUiThread { setStatus("Offline. Retrying...", false) }
-            handler.postDelayed({ connectServer() }, 3000)
-        }
-    }
-
-    private fun handle(m: JSONObject) {
-        when (m.getString("type")) {
-            "registered" -> {
-                myId = m.getString("id")
-                prefs.edit().putString("id", myId).apply()
-                idText.text = myId.chunked(3).joinToString(" ")
-                setStatus("Online", true)
-            }
-            "request" -> askPermission(m.getString("from"))
-            "accept" -> {
-                setStatus("Connected to ${m.getString("from")}", true)
-                connectBtn.isEnabled = false
-                connectBtn.alpha = 0.4f
-                endBtn.visibility = View.VISIBLE
-            }
-            "deny" -> sessionEnded("Request denied")
-            "end" -> sessionEnded("Session ended by the other phone")
-            "error" -> { setStatus(m.optString("message"), true); toast(m.optString("message")) }
-        }
-    }
-
     private fun askPermission(from: String) {
-        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+        dialog = AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
             .setTitle("Remote access request")
-            .setMessage("ID $from wants to view and control this phone.\n\nOnly allow someone you know and trust.")
+            .setMessage(
+                "ID ${fmt(from)} wants to view and control this phone.\n\n" +
+                "Only allow someone you know and trust. You can stop at any time " +
+                "from the notification or by ending the session."
+            )
             .setCancelable(false)
             .setPositiveButton("ALLOW") { _, _ ->
-                peerId = from
-                send(JSONObject().put("type", "accept").put("to", from))
-                setStatus("Connected to $from", true)
-                endBtn.visibility = View.VISIBLE
+                handledFor = from
+                if (RemoteControlService.instance == null) {
+                    toast("Remote control is OFF: they can view but not control. Turn it on in Accessibility settings.")
+                }
+                val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                startActivityForResult(mpm.createScreenCaptureIntent(), REQ_CAPTURE)
             }
             .setNegativeButton("DENY") { _, _ ->
-                send(JSONObject().put("type", "deny").put("to", from))
+                handledFor = from
+                Hub.denyPending()
             }
             .show()
     }
 
-    override fun onDestroy() {
-        closing = true
-        ws?.close(1000, null)
-        super.onDestroy()
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_CAPTURE) return
+        val from = Hub.pendingFrom
+        if (resultCode == RESULT_OK && data != null && from != null) {
+            ScreenShareService.start(this, data, from)
+        } else {
+            toast("Screen sharing was not allowed")
+            Hub.denyPending()
+        }
     }
 }
