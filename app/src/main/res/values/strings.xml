@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_description">Lets the person you approved tap, swipe and press Back, Home and Recents on this phone. It only works while a RemoteCheck session that you allowed is active.</string>
+</resources>
