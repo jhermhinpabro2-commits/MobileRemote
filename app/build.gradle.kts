@@ -10,8 +10,9 @@ android {
         applicationId = "com.remotecheck"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -22,4 +23,5 @@ android {
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("io.github.webrtc-sdk:android:125.6422.07")
 }
